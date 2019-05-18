@@ -1,0 +1,269 @@
+/** NOTE NOTE NOTE: WILL NOT MERGE SUBJECTS WITH "NO SUBJECT" OR LENGTH IS IS LESS THAN 11 CHARACTERS **/
+/* Mods:
+03042019 - Change status based on current status, email recipients and attachment
+03052019 - Modified Conditioning
+03062019 - Merge Based on Subject
+05172019 - Updated deptId to Orders' and other variables to streamline with Order Verification's setup.
+		- line 50 - assocTickets - added search parameter ticket type = parent ticket,other,none; up'd the limit search from 5 to 10
+		- Line 78 - added "r_status==FCL-EXPORT"
+		- line 242 - added condition that if status is FCL-EXPORT keep it
+		- line 32 - optimized the function on finding and removing the subject preheaders.
+		- line 245 - added function to check if it has a blueprint, and revoke blueprint so it can update the ticket status.
+*/
+//Args: ticketId
+/** IMPORTANT! ADD HEADERS AND AUTH HERE  **/
+deptId = ;
+orgId = ;
+genKey = ;
+// GET SUBJECT
+ticketDetails = invokeurl
+[
+	url :"https://desk.zoho.com/api/v1/tickets/" + ticketId
+	type :GET
+	headers:{"orgId":orgId,"Authorization":"Zoho-authtoken " + genKey}
+];
+origSubj = ifnull(ticketDetails.get("subject"),"");
+status = ticketDetails.get("status");
+/** START OF SEARCH & MERGEand  FUNCTION
+-- DETERMINE IF IT IS A FOLLOW UP EMAIL : Use Subject. Remove Re or Fwd or Both. Look for tickets from now til 3 months ago **/
+if(origSubj.containsIgnoreCase("No subject") == false && origSubj.length() >= 11)
+{
+	// Insert a space after the colon for the capitalization later
+	subj = origSubj.replaceAll(":",": ");
+	// Then set the capitalization to Proper Case
+	subj = subj.proper();
+	// Remove those pre headers
+	if(subj.contains("Re:") == true || subj.contains("Fwd:") == true)
+	{
+		subj = subj.remove("Fwd:");
+		subj = subj.remove("Re:");
+	}
+	newsubj = subj;
+	// WILL NOT SHOW ALL RESULT IF HAS CREATEDTIMERANGE
+	//	frommonth = zoho.currentdate.toDate().subMonth(3).toString("yyyy-MM-dd'T'HH:mm:ss'.00Z'");
+	//	tomonth = zoho.currenttime.addMinutes(180).toString("yyyy-MM-dd'T'HH:mm:ss'.00Z'");
+	//"&createdTimeRange=" + frommonth + "," + tomonth + 
+	// Include this in param search: Parent Ticket, Subj, 
+	encode_ttype = encodeurl("Ticket Type:");
+	multiValue= encodeurl("{Parent Ticket,-None-,Other}");
+	assocTickets = invokeurl
+	[
+		url :"https://desk.zoho.com/api/v1/tickets/search?departmentId=" + deptId + "&channel=EMAIL&customField1="+encode_ttype+multiValue+"&subject=" + encodeurl(newsubj) + "*&limit=10"
+		type :GET
+		headers:{"orgId":orgId + "","Authorization":"Zoho-authtoken " + genKey}
+	];
+	info "\n\n Search results with modified subject" + assocTickets + "\n\n";
+	//GET ALL RESULTS
+	results = ifnull(assocTickets.get("data"),"");
+	//IF SEARCH RESULT IS MORE THAN 1 - MEANING IT HAS OTHER EMAILS
+	if(results.size() > 1)
+	{
+		//EXCLUDE THIS TICKETID, FIND WHICH TICKET SHOULD BE THE MASTER RECORD
+		//All IDs of tickets with Entry status
+		entryIds = Collection();
+		//All IDs of tickets with a cntr#
+		cntrIds = Collection();
+		//All IDs of tickets that is neither Entry nor has cntr#
+		resultsId = Collection();
+		rep = 0;
+		for each  tix in results
+		{
+			tixId = results.get(rep).get("id");
+			//	if(tixId.equalsIgnoreCase(ticketId)==false){
+			r_status = results.get(rep).get("status");
+			r_modTime = results.get(rep).get("modifiedTime");
+			if(r_status.containsIgnoreCase("Entry") == true || r_status == "FCL-EXPORT")
+			{
+				entryIds.insert(tixId:r_modTime);
+			}
+			else
+			{
+				//if(r_status.containsIgnoreCase("Entry") == false)
+				r_cntrField = ifnull(results.get(rep).get("customFields").getJSON("Container/Booking"),"");
+				if(r_cntrField.length() > 1)
+				{
+					cntrIds.insert(tixId:r_modTime);
+				}
+			}
+			resultsId.insert(tixId:r_modTime);
+			//		}
+			rep = rep + 1;
+		}
+		//FIND MASTERID
+		masterId = "";
+		statusId = ticketId;
+		if(entryIds.size() > 0)
+		{
+			if(entryIds.size() = 1)
+			{
+				masterId = entryIds.keys().get(0);
+				statusId = masterId;
+			}
+			else if(entryIds.size() > 1)
+			{
+				entryModTime = List();
+				for each  modTime in entryIds
+				{
+					entryModTime.add(modTime);
+				}
+				earliest = entryModTime.sort(true).get(0);
+				masterId = entryIds.getKey(earliest);
+				statusId = masterId;
+				entryModTime.clear();
+			}
+		}
+		else if(cntrIds.size() > 0)
+		{
+			if(cntrIds.size() = 1)
+			{
+				masterId = cntrIds.keys().get(0);
+			}
+			else if(cntrIds.size() > 1)
+			{
+				entryModTime = List();
+				for each  modTime in cntrIds
+				{
+					entryModTime.add(modTime);
+				}
+				earliest = entryModTime.sort(true).get(0);
+				masterId = cntrIds.getKey(earliest);
+				entryModTime.clear();
+			}
+		}
+		else
+		{
+			entryModTime = List();
+			for each  modTime in resultsId
+			{
+				entryModTime.add(modTime);
+			}
+			earliest = entryModTime.sort(true).get(0);
+			masterId = resultsId.getKey(earliest);
+			entryModTime.clear();
+		}
+		//remove the masterId from the results
+		resultsId.deleteKey(masterId);
+		// MERGE ALL 
+		if(resultsId.size() == 1)
+		{
+			mergeThisId = resultsId.keys().get(0);
+			mergeTickets = {"ids":{mergeThisId},"source":{"status":statusId}};
+			mergeThem = invokeurl
+			[
+				url :"https://desk.zoho.com/api/v1/tickets/" + masterId + "/merge"
+				type :POST
+				parameters:mergeTickets.toString()
+				headers:{"orgId":orgId,"Authorization":"Zoho-authtoken " + genKey,"Content-Type":"application/json"}
+			];
+		}
+		else if(resultsId.size() > 1)
+		{
+			loop = 0;
+			for each  r_ticket in resultsId
+			{
+				mergeThisId = resultsId.keys().get(loop);
+				mergeTickets = {"ids":{mergeThisId}};
+				mergeThem = invokeurl
+				[
+					url :"https://desk.zoho.com/api/v1/tickets/" + masterId + "/merge"
+					type :POST
+					parameters:mergeTickets.toString()
+					headers:{"orgId":orgId,"Authorization":"Zoho-authtoken " + genKey,"Content-Type":"application/json"}
+				];
+				loop = loop + 1;
+			}
+		}
+	}
+	info mergeThem;
+}
+/**--EOF SEARCH AND MERGE FUNCTION--**/
+/** START OF FCL/LCL FILTER **/
+// CHECK IF TICKETID WAS MERGED, USE MASTERID IF SO
+searchTicketId = invokeurl
+[
+	url :"https://desk.zoho.com/api/v1/tickets/search?departmentId=" + deptId + "&id=" + ticketId
+	type :GET
+	headers:{"orgId":orgId + "","Authorization":"Zoho-authtoken " + genKey}
+];
+if(searchTicketId.get("data").isNull() == true)
+{
+	ticketId = masterId;
+}
+else
+{
+	ticketId = ticketId;
+}
+// GET EMAIL RECIPIENTS AND DETERMINE IF IT HAS AN ATTACHMENT
+ticketDetails = invokeurl
+[
+	url :"https://desk.zoho.com/api/v1/tickets/" + ticketId + "/latestThread"
+	type :GET
+	headers:{"orgId":orgId,"Authorization":"Zoho-authtoken " + genKey}
+];
+// ALL EMAIL RECIPIENTS
+allEmails = List();
+em_from = ifnull(ticketDetails.get("fromEmailAddress"),"");
+allEmails.add(em_from);
+em_cc = ifnull(ticketDetails.get("cc"),"");
+allEmails.add(em_cc);
+em_to = ifnull(ticketDetails.get("to"),"");
+allEmails.add(em_to);
+// ATTACHMENT EXISTS?
+hasDoc = ticketDetails.get("hasAttach");
+// STATUS - Do we need to check its previous status? Yes, for the follow up email in a ticket that is not yet entered.
+currentStat = invokeurl
+[
+	url :"https://desk.zoho.com/api/v1/tickets/" + ticketId
+	type :GET
+	headers:{"orgId":orgId,"Authorization":"Zoho-authtoken " + genKey}
+];
+status = ifnull(currentStat.get("status"),"");
+// IF STATUS IS NOT AN ENTRY AND LCL IS COPIED
+if(allEmails.containsIgnoreCase("lcl@blitztransportation.com") == true)
+{
+	// CHANGE THIS TO LCL - ENTRY . What other fields need to be updated when it is an LCL?
+	status = "LCL-ENTRY";
+}
+// IF LCL IS NOT COPIED BUT IT HAS AN ATTACHMENT
+else if(allEmails.containsIgnoreCase("lcl@blitztransportation.com") == false && hasDoc == true)
+{
+	// CHANGE THIS TO FCL - ENTRY. What other fields need to be updated when it is an FCL?
+	status = "FCL-ENTRY";
+}
+// IF LCL IS NOT COPIED AND IT HAS NO ATTACHMENT
+else if(hasDoc == false && status.containsIgnoreCase("Entry") == false && status.equals("FCL-EXPORT") == false)
+{
+	status = "Inbox";
+}
+// IF LCL IS NOT COPIED AND IT HAS NO ATTACHMENT BUT THE TICKET IS AN ENTRY & NOT YET ENTERED
+else if(hasDoc == false && (status.containsIgnoreCase("Entry") == true || status.equals("FCL-EXPORT") == true))
+{
+	status = status;
+}
+updateStat = {"status":status};
+// CHECK IF TICKET IS IN A BLUEPRINT ,IF SO. REVOKE BLUEPRINT BEFORE UPDATING THE STATUS
+checkBPExist = invokeurl
+[
+url:"https://support.zoho.com/api/v1/tickets/"+ticketId+"/blueprint"
+type: GET
+headers:{"orgId":orgId + "","Authorization":"Zoho-authtoken " + genKey}
+];
+resultBPexist = ifnull(checkBPExist.get(0),"");
+if(!isnull(checkBPExist))
+{
+	revokeBP = invokeurl
+	[
+	url :"https://support.zoho.com/api/v1/tickets/"+ticketId+"/revokeBlueprint"
+	type :POST
+	headers:{"orgId":orgId + "","Authorization":"Zoho-authtoken " + genKey,"X-HTTP-Method-Override":"UPDATE"}
+	];
+}
+/** UPDATE TICKET **/
+updateTicket = invokeurl
+[
+	url :"https://desk.zoho.com/api/v1/tickets/" + ticketId
+	type :POST
+	parameters:updateStat.toString()
+	headers:{"orgId":orgId + "","Authorization":"Zoho-authtoken " + genKey,"X-HTTP-Method-Override":"PATCH"}
+];
+info updateTicket;
